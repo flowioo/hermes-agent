@@ -1910,54 +1910,15 @@ _TERMINAL_INPUT_MODE_RESET_SEQ = (
 )
 
 
-def _preserve_ctrl_enter_newline() -> bool:
-    """Detect environments where Ctrl+Enter must produce a newline, not submit.
-
-    Native Windows, WSL, SSH sessions, and Windows Terminal all send Ctrl+Enter
-    as bare LF (c-j). On those terminals c-j must NOT be bound to submit;
-    binding it to submit makes Ctrl+Enter (intended as 'newline like Alt+Enter')
-    submit instead. Local POSIX TTYs that deliver Enter as LF (docker exec,
-    some thin PTYs without SSH) still need c-j bound to submit, so we keep
-    that binding for those.
-
-    See issue #22379.
-    """
-    if sys.platform == "win32":
-        return True
-    if any(os.environ.get(v) for v in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
-        return True
-    if os.environ.get("WT_SESSION"):
-        return True
-    if "microsoft" in os.environ.get("WSL_DISTRO_NAME", "").lower():
-        return True
-    # WSL detection — env vars can be scrubbed under sudo, also peek /proc.
-    for p in ("/proc/version", "/proc/sys/kernel/osrelease"):
-        try:
-            with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                if "microsoft" in f.read().lower():
-                    return True
-        except OSError:
-            continue
-    return False
-
-
 def _bind_prompt_submit_keys(kb, handler) -> None:
     """Bind terminal Enter forms to the submit handler.
 
-    Enter is always submit. On POSIX we also bind c-j (LF) to submit because
-    some thin PTYs (docker exec, certain SSH flavors) deliver Enter as LF
-    instead of CR — without this, Enter appears dead on those terminals.
-
-    Exception: on Windows, WSL, SSH sessions, and Windows Terminal,
-    c-j is the wire encoding of Ctrl+Enter (a distinct keystroke from
-    plain Enter / c-m). We leave c-j unbound there so the c-j newline
-    handler registered separately can fire — giving the user an
-    Enter-involving newline keystroke without terminal settings changes.
-    See _preserve_ctrl_enter_newline() and issue #22379.
+    Enter (c-m) is always submit. We no longer bind c-j (LF) to submit
+    because Ctrl+J is reserved for inserting a newline across all platforms.
+    Most terminals send Enter as CR (c-m); the rare thin PTYs that send
+    LF can still submit with Ctrl+M.
     """
     kb.add("enter")(handler)
-    if sys.platform != "win32" and not _preserve_ctrl_enter_newline():
-        kb.add("c-j")(handler)
 
 
 def _disable_prompt_toolkit_cpr_warning(app) -> None:
@@ -5187,7 +5148,9 @@ class HermesCLI:
                 )
 
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
-        _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}")
+        _cprint(f"  {_DIM}Multi-line: Alt+Enter or Ctrl+J for a new line{_RST}")
+        _cprint(f"  {_DIM}Indent: Ctrl+T / Ctrl+D (dedent){_RST}")
+        _cprint(f"  {_DIM}Delete line before: Ctrl+U / word: Ctrl+W{_RST}")
         _cprint(f"  {_DIM}Draft editor: Ctrl+G (Alt+G in VSCode/Cursor){_RST}")
         if _is_termux_environment():
             _cprint(f"  {_DIM}Attach image: /image {_termux_example_image_path()} or start your prompt with a local image path{_RST}\n")
@@ -11421,26 +11384,20 @@ class HermesCLI:
 
             Works on mac/Linux/WSL. On Windows Terminal this keystroke is
             intercepted at the terminal layer (toggles fullscreen) and never
-            reaches here — Windows users get newline via Ctrl+Enter instead
-            (bound below as c-j, since WT delivers Ctrl+Enter as LF).
+            reaches here.
             """
             event.current_buffer.insert_text('\n')
 
-        if _preserve_ctrl_enter_newline():
-            @kb.add('c-j')
-            def handle_ctrl_enter_newline(event):
-                """Ctrl+Enter inserts a newline on Windows, WSL, SSH, and WT.
+        @kb.add('c-j', eager=True)
+        def handle_ctrl_j_newline(event):
+            """Ctrl+J inserts a newline on all platforms.
 
-                Windows Terminal (incl. WSL/SSH sessions through it) delivers
-                Ctrl+Enter as LF (c-j), distinct from plain Enter (c-m). This
-                binding makes Ctrl+Enter the equivalent of Alt+Enter on those
-                terminals, giving an Enter-involving newline keystroke
-                without requiring terminal settings changes. Ctrl+J (the raw
-                LF keystroke) also triggers this by virtue of being the same
-                key code — a harmless side effect since Ctrl+J has no
-                conflicting Hermes binding. See issue #22379.
-                """
-                event.current_buffer.insert_text('\n')
+            Bound globally so users have a consistent, easy-to-reach
+            multi-line keystroke regardless of terminal or OS.
+            Eager=True ensures it wins over prompt_toolkit's default c-j→enter
+            mapping in basic.py (_newline2).
+            """
+            event.current_buffer.insert_text('\n')
 
         # VSCode/Cursor bind Ctrl+G to "Find Next" at the editor level, so
         # the keystroke never reaches the embedded terminal. Alt+G is unbound
@@ -11620,6 +11577,57 @@ class HermesCLI:
         _normal_input = Condition(
             lambda: not self._clarify_state and not self._approval_state and not self._slash_confirm_state and not self._sudo_state and not self._secret_state and not self._model_picker_state
         )
+
+        @kb.add('c-t', filter=_normal_input)
+        def handle_ctrl_t_indent(event):
+            """Ctrl+T: indent current line."""
+            buf = event.current_buffer
+            doc = buf.document
+            line_start = buf.cursor_position - len(doc.current_line_before_cursor)
+            rel = len(doc.current_line_before_cursor)
+            buf.cursor_position = line_start
+            buf.insert_text('    ')
+            buf.cursor_position = line_start + rel + 4
+
+        @kb.add('c-d', filter=_normal_input)
+        def handle_ctrl_d_dedent(event):
+            """Ctrl+D: dedent current line."""
+            buf = event.current_buffer
+            doc = buf.document
+            line_start = buf.cursor_position - len(doc.current_line_before_cursor)
+            rel = len(doc.current_line_before_cursor)
+            line = doc.current_line
+            if line.startswith('\t'):
+                remove = 1
+            elif line.startswith('    '):
+                remove = 4
+            elif line.startswith('  '):
+                remove = 2
+            elif line.startswith(' '):
+                remove = 1
+            else:
+                return
+            buf.cursor_position = line_start
+            buf.delete(count=remove)
+            buf.cursor_position = line_start + max(0, rel - remove)
+
+        @kb.add('c-u', filter=_normal_input)
+        def handle_ctrl_u_delete_line_before(event):
+            """Ctrl+U: delete from line start to cursor."""
+            buf = event.current_buffer
+            doc = buf.document
+            before = doc.current_line_before_cursor
+            if before:
+                buf.delete_before_cursor(count=len(before))
+
+        @kb.add('c-w', filter=_normal_input)
+        def handle_ctrl_w_delete_word_before(event):
+            """Ctrl+W: delete word before cursor."""
+            buf = event.current_buffer
+            doc = buf.document
+            word = doc.get_word_before_cursor()
+            if word:
+                buf.delete_before_cursor(count=len(word))
 
         @kb.add('up', filter=_normal_input)
         def history_up(event):
