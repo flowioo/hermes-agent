@@ -1910,21 +1910,92 @@ _TERMINAL_INPUT_MODE_RESET_SEQ = (
 )
 
 
+def _preserve_ctrl_enter_newline() -> bool:
+    """Detect environments where Ctrl+Enter must produce a newline, not submit.
+
+    Native Windows, WSL, SSH sessions, and Windows Terminal all send Ctrl+Enter
+    as bare LF (c-j). On those terminals c-j must NOT be bound to submit;
+    binding it to submit makes Ctrl+Enter (intended as 'newline like Alt+Enter')
+    submit instead. Local POSIX TTYs that deliver Enter as LF (docker exec,
+    some thin PTYs without SSH) still need c-j bound to submit, so we keep
+    that binding for those.
+
+    See issue #22379.
+    """
+    if sys.platform == "win32":
+        return True
+    if any(os.environ.get(v) for v in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
+        return True
+    if os.environ.get("WT_SESSION"):
+        return True
+    if "microsoft" in os.environ.get("WSL_DISTRO_NAME", "").lower():
+        return True
+    # WSL detection — env vars can be scrubbed under sudo, also peek /proc.
+    for p in ("/proc/version", "/proc/sys/kernel/osrelease"):
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                if "microsoft" in f.read().lower():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def _bind_prompt_submit_keys(kb, handler) -> None:
     """Bind terminal Enter forms to the submit handler.
 
     Enter (c-m) is always submit. We no longer bind c-j (LF) to submit
-    because Ctrl+J is reserved for inserting a newline across all platforms.
-    Most terminals send Enter as CR (c-m); the rare thin PTYs that send
-    LF can still submit with Ctrl+M.
-
-    Escape hatch: set HERMES_CLI_SUBMIT_ON_LF=1 to restore the old c-j
-    submit behavior for thin PTYs (e.g. docker exec) that deliver Enter
-    as bare LF and where Ctrl+M is not available.
+    because Ctrl+J is reserved for inserting a newline globally via the
+    eager binding registered below.
     """
     kb.add("enter")(handler)
-    if os.environ.get("HERMES_CLI_SUBMIT_ON_LF") == "1":
-        kb.add("c-j")(handler)
+
+
+def _indent_current_line(buf) -> None:
+    """Insert 4 spaces at the start of the current line."""
+    doc = buf.document
+    line_start = buf.cursor_position - len(doc.current_line_before_cursor)
+    rel = len(doc.current_line_before_cursor)
+    buf.cursor_position = line_start
+    buf.insert_text("    ")
+    buf.cursor_position = line_start + rel + 4
+
+
+def _dedent_current_line(buf) -> None:
+    """Remove leading indent (tab or 1-4 spaces) from the current line."""
+    doc = buf.document
+    line_start = buf.cursor_position - len(doc.current_line_before_cursor)
+    rel = len(doc.current_line_before_cursor)
+    line = doc.current_line
+    if line.startswith("\t"):
+        remove = 1
+    elif line.startswith("    "):
+        remove = 4
+    elif line.startswith("  "):
+        remove = 2
+    elif line.startswith(" "):
+        remove = 1
+    else:
+        return
+    buf.cursor_position = line_start
+    buf.delete(count=remove)
+    buf.cursor_position = line_start + max(0, rel - remove)
+
+
+def _delete_line_before_cursor(buf) -> None:
+    """Delete from the start of the current line to the cursor."""
+    doc = buf.document
+    before = doc.current_line_before_cursor
+    if before:
+        buf.delete_before_cursor(count=len(before))
+
+
+def _delete_word_before_cursor(buf) -> None:
+    """Delete the word before the cursor."""
+    doc = buf.document
+    word = doc.get_word_before_cursor()
+    if word:
+        buf.delete_before_cursor(count=len(word))
 
 
 def _disable_prompt_toolkit_cpr_warning(app) -> None:
@@ -11401,7 +11472,8 @@ class HermesCLI:
             Bound globally so users have a consistent, easy-to-reach
             multi-line keystroke regardless of terminal or OS.
             Eager=True ensures it wins over prompt_toolkit's default c-j→enter
-            mapping in basic.py (_newline2).
+            mapping in basic.py (_newline2) and over any c-j submit binding
+            from _bind_prompt_submit_keys.
             """
             event.current_buffer.insert_text('\n')
 
@@ -11587,53 +11659,22 @@ class HermesCLI:
         @kb.add('c-t', filter=_normal_input)
         def handle_ctrl_t_indent(event):
             """Ctrl+T: indent current line."""
-            buf = event.current_buffer
-            doc = buf.document
-            line_start = buf.cursor_position - len(doc.current_line_before_cursor)
-            rel = len(doc.current_line_before_cursor)
-            buf.cursor_position = line_start
-            buf.insert_text('    ')
-            buf.cursor_position = line_start + rel + 4
+            _indent_current_line(event.current_buffer)
 
         @kb.add('c-d', filter=_normal_input)
         def handle_ctrl_d_dedent(event):
             """Ctrl+D: dedent current line."""
-            buf = event.current_buffer
-            doc = buf.document
-            line_start = buf.cursor_position - len(doc.current_line_before_cursor)
-            rel = len(doc.current_line_before_cursor)
-            line = doc.current_line
-            if line.startswith('\t'):
-                remove = 1
-            elif line.startswith('    '):
-                remove = 4
-            elif line.startswith('  '):
-                remove = 2
-            elif line.startswith(' '):
-                remove = 1
-            else:
-                return
-            buf.cursor_position = line_start
-            buf.delete(count=remove)
-            buf.cursor_position = line_start + max(0, rel - remove)
+            _dedent_current_line(event.current_buffer)
 
         @kb.add('c-u', filter=_normal_input)
         def handle_ctrl_u_delete_line_before(event):
             """Ctrl+U: delete from line start to cursor."""
-            buf = event.current_buffer
-            doc = buf.document
-            before = doc.current_line_before_cursor
-            if before:
-                buf.delete_before_cursor(count=len(before))
+            _delete_line_before_cursor(event.current_buffer)
 
         @kb.add('c-w', filter=_normal_input)
         def handle_ctrl_w_delete_word_before(event):
             """Ctrl+W: delete word before cursor."""
-            buf = event.current_buffer
-            doc = buf.document
-            word = doc.get_word_before_cursor()
-            if word:
-                buf.delete_before_cursor(count=len(word))
+            _delete_word_before_cursor(event.current_buffer)
 
         @kb.add('up', filter=_normal_input)
         def history_up(event):
