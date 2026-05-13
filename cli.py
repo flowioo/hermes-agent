@@ -1917,8 +1917,14 @@ def _bind_prompt_submit_keys(kb, handler) -> None:
     because Ctrl+J is reserved for inserting a newline across all platforms.
     Most terminals send Enter as CR (c-m); the rare thin PTYs that send
     LF can still submit with Ctrl+M.
+
+    Escape hatch: set HERMES_CLI_SUBMIT_ON_LF=1 to restore the old c-j
+    submit behavior for thin PTYs (e.g. docker exec) that deliver Enter
+    as bare LF and where Ctrl+M is not available.
     """
     kb.add("enter")(handler)
+    if os.environ.get("HERMES_CLI_SUBMIT_ON_LF") == "1":
+        kb.add("c-j")(handler)
 
 
 def _disable_prompt_toolkit_cpr_warning(app) -> None:
