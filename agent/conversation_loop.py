@@ -27,6 +27,9 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from agent.anthropic_adapter import _is_oauth_token
+from agent.auxiliary_client import set_runtime_main
+from agent.circuit_breaker import CircuitOpenError, get_breaker
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -800,6 +803,13 @@ def run_conversation(
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
+        # Circuit breaker: trip after N consecutive transient errors to avoid
+        # 30+ minute retry loops when the upstream is stuck.  We use the
+        # shared "main" scope so vision/subagent failures don't pollute this
+        # breaker's state, and vice versa.
+        # See docs/incidents/2026-06-08-hermes-retry-loop for motivation.
+        _main_breaker = get_breaker("main")
+        primary_recovery_attempted = False
         max_compression_attempts = 3
 
         finish_reason = "stop"
@@ -955,6 +965,35 @@ def run_conversation(
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
+                # ── DEBUG: LLM input snapshot (gated) ─────────────────────
+                # Off by default; turn on with HERMES_DEBUG_LLM_IO=1 to log
+                # one line per API call with model/url/msg_count.  Useful
+                # when reproducing upstream incidents — pairs with
+                # DEBUG_CB (always-on, see below) which logs the breaker
+                # state on every failure.
+                if env_var_enabled("HERMES_DEBUG_LLM_IO"):
+                    try:
+                        _dbg_model = api_kwargs.get("model", "?")
+                        _dbg_url = (
+                            getattr(agent, "base_url", None)
+                            or api_kwargs.get("__bedrock_region__", "")
+                            or "?"
+                        )
+                        _dbg_msgs = api_kwargs.get("messages") or api_kwargs.get("input") or []
+                        _dbg_msg_count = len(_dbg_msgs) if hasattr(_dbg_msgs, "__len__") else 0
+                        _dbg_last_role = _dbg_msgs[-1].get("role", "?") if _dbg_msg_count else "?"
+                        # _use_streaming is assigned later in this block; default
+                        # to None when this snapshot runs before the assignment.
+                        _dbg_stream = locals().get("_use_streaming", None)
+                        logger.info(
+                            "LLM_IN: call#%d attempt=%d api_mode=%s model=%s "
+                            "base_url=%s msg_count=%d last_role=%s stream=%s",
+                            api_call_count, retry_count, getattr(agent, "api_mode", "?"),
+                            _dbg_model, _dbg_url, _dbg_msg_count, _dbg_last_role, _dbg_stream,
+                        )
+                    except Exception as _dbg_e:
+                        logger.debug("LLM_IN snapshot failed: %s", _dbg_e)
+
                 # Always prefer the streaming path — even without stream
                 # consumers.  Streaming gives us fine-grained health
                 # checking (90s stale-stream detection, 60s read timeout)
@@ -1036,6 +1075,27 @@ def run_conversation(
                 
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}⏱️  API call completed in {api_duration:.2f}s")
+
+                # ── DEBUG: LLM output snapshot (gated) ────────────────────
+                if env_var_enabled("HERMES_DEBUG_LLM_IO"):
+                    try:
+                        _dbg_resp_type = type(response).__name__ if response is not None else "None"
+                        _dbg_resp_model = getattr(response, "model", "?") if response else "?"
+                        _dbg_resp_id = getattr(response, "id", "?") if response else "?"
+                        _dbg_resp_usage = getattr(response, "usage", None)
+                        _dbg_usage_str = (
+                            f"in={getattr(_dbg_resp_usage, 'prompt_tokens', '?')} "
+                            f"out={getattr(_dbg_resp_usage, 'completion_tokens', '?')}"
+                            if _dbg_resp_usage else "no_usage"
+                        )
+                        logger.info(
+                            "LLM_OUT: call#%d attempt=%d resp_type=%s model=%s "
+                            "id=%s usage=%s duration=%.2fs",
+                            api_call_count, retry_count, _dbg_resp_type, _dbg_resp_model,
+                            _dbg_resp_id, _dbg_usage_str, api_duration,
+                        )
+                    except Exception as _dbg_e:
+                        logger.debug("LLM_OUT snapshot failed: %s", _dbg_e)
                 
                 if agent.verbose_logging:
                     # Log response with provider info if available
@@ -1718,6 +1778,11 @@ def run_conversation(
                     except Exception:
                         pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
+                # Reset the circuit breaker on successful API response.
+                try:
+                    _main_breaker.record_success()
+                except Exception:
+                    pass
                 break  # Success, exit retry loop
 
             except InterruptedError:
@@ -1741,6 +1806,48 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                # -----------------------------------------------------------
+                # Circuit breaker check: count this failure and short-circuit
+                # the retry loop if we've hit the threshold.  We do this
+                # before the per-error-type recovery blocks (UnicodeEncode,
+                # surrogate, auth rotation, etc.) so that genuine upstream
+                # outages — which those blocks can't fix — stop the runaway
+                # retry loop within ~3 attempts instead of 30+ minutes.
+                # See docs/incidents/2026-06-08-hermes-retry-loop for the
+                # postmortem that motivated this.
+                try:
+                    # Always log the breaker state on every API failure so
+                    # ops can correlate "circuit_breaker tripped" with the
+                    # concrete exception class.  Fires on EVERY failure,
+                    # not just the tripping one — count is visible in
+                    # breaker_count, so the trajectory is reconstructable.
+                    logger.error(
+                        "CB_STATE: api_error type=%s mro=%s "
+                        "is_open=%s breaker_count=%d err_str=%r",
+                        type(api_error).__name__,
+                        "->".join(c.__name__ for c in type(api_error).__mro__),
+                        _main_breaker.is_open(),
+                        _main_breaker.snapshot()[2],
+                        str(api_error)[:200],
+                    )
+                    if _main_breaker.record_failure(api_error):
+                        err_type, cb_remaining, cb_count = _main_breaker.snapshot()
+                        logger.error(
+                            "%scircuit_breaker tripped: %d consecutive %s, "
+                            "cooldown %.1fs. Forcing fallback path.",
+                            agent.log_prefix, cb_count, err_type, cb_remaining,
+                        )
+                        agent._emit_status(
+                            f"⚠️ Circuit breaker tripped ({cb_count}× {err_type}) — "
+                            f"activating fallback or surfacing error"
+                        )
+                        # Skip remaining retry budget and jump straight to
+                        # the fallback-activation branch below.
+                        retry_count = max_retries
+                except Exception:
+                    # Never let the breaker bookkeeping break the loop.
+                    pass
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
