@@ -100,6 +100,7 @@ class _OpenAIProxy:
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
+from agent.circuit_breaker import get_breaker as _get_breaker
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, model_forces_max_completion_tokens, normalize_proxy_env_vars
@@ -5508,6 +5509,23 @@ def call_llm(
             except Exception:
                 logger.debug("Auxiliary: cache eviction after connection error failed",
                              exc_info=True)
+        # ── Shared circuit breaker ──────────────────────────────────────
+        # Auxiliary calls (vision, browser, compression, etc.) share the
+        # "auxiliary" scope.  A repeated connection/timeout error here means
+        # the upstream (e.g. ccr → glm) is stuck, and we should record it so
+        # the breaker can trip.  See docs/incidents/2026-06-08-hermes-retry-loop.
+        try:
+            _aux_breaker = _get_breaker("auxiliary")
+            if _aux_breaker.record_failure(first_err):
+                err_type, remaining, count = _aux_breaker.snapshot()
+                logger.error(
+                    "Auxiliary %s: circuit_breaker tripped: %d consecutive %s, "
+                    "cooldown %.1fs. Caller should back off.",
+                    task or "call", count, err_type, remaining,
+                )
+        except Exception:
+            # Never let breaker bookkeeping mask the real error.
+            pass
         raise
 
 
