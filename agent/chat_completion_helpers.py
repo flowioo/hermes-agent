@@ -35,6 +35,15 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+
+# Minimum length (chars) of recovered partial content for it to be
+# useful as a stub message in conversation history.  Shorter stubs
+# poison the next turn: the LLM sees a few chars it can't reason about
+# and issues a near-identical request that hits the same timeout.
+# 200 chars is a conservative lower bound — enough for one short
+# sentence of reasoning.  Tunable via HERMES_STUB_MIN_CHARS env var.
+import os as _os
+STUB_MIN_USABLE_LENGTH = int(_os.environ.get("HERMES_STUB_MIN_CHARS", "200"))
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.model_metadata import is_local_endpoint
 from agent.message_sanitization import (
@@ -2271,12 +2280,29 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 _stub_finish_reason = FINISH_REASON_LENGTH
             else:
+                _recovered_len = len(_partial_text or "")
+                if _recovered_len < STUB_MIN_USABLE_LENGTH:
+                    # Too little content recovered — injecting a stub this
+                    # short is worse than no stub at all: the next LLM
+                    # call can't make sense of 16-180 chars and will just
+                    # re-issue the same request, hitting the same
+                    # timeout/limit.  See docs/incidents/2026-06-08-hermes-
+                    # retry-loop.  Surface the original error so the
+                    # circuit breaker can trip or a fallback can engage.
+                    logger.warning(
+                        "stream_recovery: only %d chars recovered (< %d "
+                        "threshold); NOT injecting stub to history, "
+                        "raising original error: %s",
+                        _recovered_len, STUB_MIN_USABLE_LENGTH,
+                        result["error"],
+                    )
+                    raise result["error"]
                 logger.warning(
                     "Partial stream delivered before error; returning "
                     "length-truncated stub with %s chars of recovered "
                     "content so the loop can continue from where the "
                     "stream died: %s",
-                    len(_partial_text or ""),
+                    _recovered_len,
                     result["error"],
                 )
                 _stub_finish_reason = FINISH_REASON_LENGTH
