@@ -2309,11 +2309,11 @@ class TestSharedBoardPaths:
         self._set_home(monkeypatch, tmp_path, default_home)
 
         assert kb.kanban_home() == default_home
-        assert kb.kanban_db_path() == default_home / "kanban.db"
-        assert kb.workspaces_root() == default_home / "kanban" / "workspaces"
+        assert kb.kanban_db_path() == default_home / "kanban" / "boards" / "default" / "kanban.db"
+        assert kb.workspaces_root() == default_home / "kanban" / "boards" / "default" / "workspaces"
         assert (
             kb.worker_log_path("t_demo")
-            == default_home / "kanban" / "logs" / "t_demo.log"
+            == default_home / "kanban" / "boards" / "default" / "logs" / "t_demo.log"
         )
 
     def test_profile_worker_resolves_to_shared_root(
@@ -2332,11 +2332,11 @@ class TestSharedBoardPaths:
         # All four resolvers must anchor at the shared root, not the
         # profile-local HERMES_HOME.
         assert kb.kanban_home() == default_home
-        assert kb.kanban_db_path() == default_home / "kanban.db"
-        assert kb.workspaces_root() == default_home / "kanban" / "workspaces"
+        assert kb.kanban_db_path() == default_home / "kanban" / "boards" / "default" / "kanban.db"
+        assert kb.workspaces_root() == default_home / "kanban" / "boards" / "default" / "workspaces"
         assert (
             kb.worker_log_path("t_0d214f19")
-            == default_home / "kanban" / "logs" / "t_0d214f19.log"
+            == default_home / "kanban" / "boards" / "default" / "logs" / "t_0d214f19.log"
         )
 
         # Sanity: the profile-local path that used to be returned is
@@ -2382,7 +2382,7 @@ class TestSharedBoardPaths:
         self._set_home(monkeypatch, tmp_path, custom_root)
 
         assert kb.kanban_home() == custom_root
-        assert kb.kanban_db_path() == custom_root / "kanban.db"
+        assert kb.kanban_db_path() == custom_root / "kanban" / "boards" / "default" / "kanban.db"
 
     def test_docker_profile_layout_uses_grandparent(
         self, tmp_path, monkeypatch
@@ -2396,7 +2396,7 @@ class TestSharedBoardPaths:
         self._set_home(monkeypatch, tmp_path, profile)
 
         assert kb.kanban_home() == custom_root
-        assert kb.kanban_db_path() == custom_root / "kanban.db"
+        assert kb.kanban_db_path() == custom_root / "kanban" / "boards" / "default" / "kanban.db"
 
     def test_explicit_override_via_hermes_kanban_home(
         self, tmp_path, monkeypatch
@@ -2414,8 +2414,8 @@ class TestSharedBoardPaths:
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(override))
 
         assert kb.kanban_home() == override
-        assert kb.kanban_db_path() == override / "kanban.db"
-        assert kb.workspaces_root() == override / "kanban" / "workspaces"
+        assert kb.kanban_db_path() == override / "kanban" / "boards" / "default" / "kanban.db"
+        assert kb.workspaces_root() == override / "kanban" / "boards" / "default" / "workspaces"
 
     def test_empty_override_falls_through(self, tmp_path, monkeypatch):
         # Empty/whitespace override is treated as unset.
@@ -2472,7 +2472,7 @@ class TestSharedBoardPaths:
         assert kb.kanban_db_path() == pinned_db
         # workspaces_root still follows HERMES_KANBAN_HOME -- the pins
         # are independent.
-        assert kb.workspaces_root() == umbrella / "kanban" / "workspaces"
+        assert kb.workspaces_root() == umbrella / "kanban" / "boards" / "default" / "workspaces"
 
     def test_hermes_kanban_workspaces_root_pin_beats_kanban_home(
         self, tmp_path, monkeypatch
@@ -2492,7 +2492,7 @@ class TestSharedBoardPaths:
 
         assert kb.workspaces_root() == pinned_ws
         # kanban_db_path still follows HERMES_KANBAN_HOME.
-        assert kb.kanban_db_path() == umbrella / "kanban.db"
+        assert kb.kanban_db_path() == umbrella / "kanban" / "boards" / "default" / "kanban.db"
 
     def test_empty_per_path_overrides_fall_through(
         self, tmp_path, monkeypatch
@@ -2506,8 +2506,8 @@ class TestSharedBoardPaths:
         monkeypatch.setenv("HERMES_KANBAN_DB", "   ")
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", "")
 
-        assert kb.kanban_db_path() == default_home / "kanban.db"
-        assert kb.workspaces_root() == default_home / "kanban" / "workspaces"
+        assert kb.kanban_db_path() == default_home / "kanban" / "boards" / "default" / "kanban.db"
+        assert kb.workspaces_root() == default_home / "kanban" / "boards" / "default" / "workspaces"
 
     def test_dispatcher_spawn_injects_kanban_db_and_workspaces_root(
         self, tmp_path, monkeypatch
@@ -2551,9 +2551,9 @@ class TestSharedBoardPaths:
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
-        assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban.db")
+        assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban" / "boards" / "default" / "kanban.db")
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
-            default_home / "kanban" / "workspaces"
+            default_home / "kanban" / "boards" / "default" / "workspaces"
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"

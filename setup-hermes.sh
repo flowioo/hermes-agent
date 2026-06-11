@@ -184,6 +184,17 @@ fi
 export VIRTUAL_ENV="$SCRIPT_DIR/venv"
 SETUP_PYTHON="$SCRIPT_DIR/venv/bin/python"
 
+# Resolve the actual venv directory. The script creates `venv` (no dot) above,
+# but `uv` defaults to `.venv` when invoked without an explicit name — which is
+# what happens if a developer runs `uv sync` directly in the repo. Detect
+# whichever exists and use it consistently for the rest of the script.
+VENV_DIR="$SCRIPT_DIR/venv"
+if [ ! -x "$VENV_DIR/bin/python" ] && [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+    VENV_DIR="$SCRIPT_DIR/.venv"
+    export VIRTUAL_ENV="$VENV_DIR"
+    SETUP_PYTHON="$VENV_DIR/bin/python"
+fi
+
 # ============================================================================
 # Dependencies
 # ============================================================================
@@ -347,7 +358,7 @@ fi
 
 echo -e "${CYAN}→${NC} Setting up hermes command..."
 
-HERMES_BIN="$SCRIPT_DIR/venv/bin/hermes"
+HERMES_BIN="$VENV_DIR/bin/hermes"
 COMMAND_LINK_DIR="$(get_command_link_dir)"
 COMMAND_LINK_DISPLAY_DIR="$(get_command_link_display_dir)"
 mkdir -p "$COMMAND_LINK_DIR"
@@ -404,7 +415,7 @@ mkdir -p "$HERMES_SKILLS_DIR"
 
 echo ""
 echo "Syncing bundled skills to ~/.hermes/skills/ ..."
-if "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/tools/skills_sync.py" 2>/dev/null; then
+if "$VENV_DIR/bin/python" "$SCRIPT_DIR/tools/skills_sync.py" 2>/dev/null; then
     echo -e "${GREEN}✓${NC} Skills synced"
 else
     # Fallback: copy if sync script fails (missing deps, etc.)
@@ -458,5 +469,5 @@ echo
 if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
     echo ""
     # Run directly with venv Python (no activation needed)
-    "$SCRIPT_DIR/venv/bin/python" -m hermes_cli.main setup
+    "$VENV_DIR/bin/python" -m hermes_cli.main setup
 fi

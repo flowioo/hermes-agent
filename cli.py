@@ -2725,6 +2725,8 @@ def _preserve_ctrl_enter_newline() -> bool:
     """
     if sys.platform == "win32":
         return True
+    if sys.platform == "darwin":
+        return True
     if any(os.environ.get(v) for v in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
         return True
     if os.environ.get("WT_SESSION"):
@@ -11193,7 +11195,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if _preserve_ctrl_enter_newline():
             @kb.add('c-j')
             def handle_ctrl_enter_newline(event):
-                """Ctrl+Enter inserts a newline on Windows, WSL, SSH, and WT.
+                """Ctrl+Enter inserts a newline on Windows, WSL, SSH, WT, and macOS.
 
                 Windows Terminal (incl. WSL/SSH sessions through it) delivers
                 Ctrl+Enter as LF (c-j), distinct from plain Enter (c-m). This

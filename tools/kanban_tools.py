@@ -77,16 +77,17 @@ def _check_kanban_mode() -> bool:
 
 
 def _check_kanban_orchestrator_mode() -> bool:
-    """Board-routing tools (kanban_list, kanban_unblock) are intentionally
-    hidden from task workers.
+    """Board-routing tools (kanban_list, kanban_unblock) are available
+    to both orchestrator profiles and dispatcher-spawned workers.
 
-    Dispatcher-spawned workers should close their own task via the
-    lifecycle tools (complete/block/heartbeat), not enumerate or unblock
-    board state. Profiles that explicitly opt into the kanban toolset
-    and are NOT scoped to a single task are the orchestrator surface.
+    Workers are already board-isolated (HERMES_KANBAN_DB pins them to
+    one board DB). Allowing them to list tasks and unblock peers lets a
+    worker that finishes early unblock its downstream dependency without
+    waiting for a human or the next dispatcher tick — reducing serial
+    latency in dependency chains.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
-        return False
+        return True
     return _profile_has_kanban_toolset()
 
 
@@ -414,9 +415,6 @@ def _handle_show(args: dict, **kw) -> str:
 
 def _handle_list(args: dict, **kw) -> str:
     """List task summaries with the same core filters as the CLI."""
-    guard = _require_orchestrator_tool("kanban_list")
-    if guard:
-        return guard
     assignee = args.get("assignee")
     status = args.get("status")
     tenant = args.get("tenant")
@@ -833,15 +831,9 @@ def _handle_create(args: dict, **kw) -> str:
 
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task back to ready."""
-    guard = _require_orchestrator_tool("kanban_unblock")
-    if guard:
-        return guard
     tid = args.get("task_id")
     if not tid:
         return tool_error("task_id is required")
-    ownership_err = _enforce_worker_task_ownership(str(tid))
-    if ownership_err:
-        return ownership_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

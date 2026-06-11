@@ -381,12 +381,12 @@ def clear_current_board() -> None:
 def board_dir(board: Optional[str] = None) -> Path:
     """Return the on-disk directory for ``board``.
 
-    ``default`` is ``<root>/kanban/boards/default/`` **for metadata only**
-    (board.json + workspaces/ + logs/). Its DB file stays at
-    ``<root>/kanban.db`` for back-compat — see :func:`kanban_db_path`.
+    All boards — including ``default`` — live at
+    ``<root>/kanban/boards/<slug>/`` with everything inside that
+    directory (board.json, kanban.db, workspaces/, logs/).
 
-    All other boards live at ``<root>/kanban/boards/<slug>/`` with
-    everything inside that directory including the ``kanban.db``.
+    On first access the legacy ``<root>/kanban.db`` is automatically
+    migrated into ``boards/default/`` — see :func:`_migrate_legacy_default_db`.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     return boards_root() / slug
@@ -406,6 +406,72 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+# Module-level lock for the legacy DB migration (thread safety).
+_LEGACY_MIGRATE_LOCK = threading.Lock()
+
+
+def _migrate_legacy_default_db(new_path: Path) -> None:
+    """Move ``<root>/kanban.db`` → ``<root>/kanban/boards/default/kanban.db``.
+
+    Idempotent: if the legacy path no longer exists or the new path
+    already exists, this is a no-op.  Thread-safe via module-level lock.
+
+    This eliminates the multi-process WAL contention on the shared
+    top-level ``kanban.db`` that was the single biggest source of DB
+    corruption for the default board.
+    """
+    with _LEGACY_MIGRATE_LOCK:
+        legacy_path = kanban_home() / "kanban.db"
+        if not legacy_path.exists() or new_path.exists():
+            return
+
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import shutil
+            # os.rename is atomic on the same filesystem
+            try:
+                os.rename(str(legacy_path), str(new_path))
+            except OSError:
+                # Cross-device or other error — fall back to copy+delete
+                shutil.copy2(str(legacy_path), str(new_path))
+                os.remove(str(legacy_path))
+            # Also migrate WAL/SHM sidecars if present
+            for ext in ("-wal", "-shm"):
+                sidecar = legacy_path.parent / (legacy_path.name + ext)
+                if sidecar.exists():
+                    try:
+                        os.rename(str(sidecar), str(new_path.parent / (new_path.name + ext)))
+                    except OSError:
+                        sidecar.unlink(missing_ok=True)
+        except Exception:
+            # Non-fatal — if migration fails the old path will be used via
+            # HERMES_KANBAN_DB fallback or next migration attempt.
+            pass
+
+
+def _migrate_legacy_dir(legacy: Path, target: Path) -> None:
+    """Migrate a legacy directory (workspaces/logs) into ``boards/default/``.
+
+    If *target* already exists (symlink or real dir) this is a no-op.
+    If *legacy* exists but *target* does not, we try ``os.rename`` first
+    (atomic, same filesystem), then fall back to creating a symlink so
+    existing data remains accessible without a costly recursive copy.
+    """
+    if target.exists() or target.is_symlink():
+        return
+    if not legacy.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(str(legacy), str(target))
+    except OSError:
+        # Cross-device or permission issue — symlink as fallback
+        try:
+            target.symlink_to(legacy)
+        except OSError:
+            pass
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -417,8 +483,11 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
        immune to any path-resolution disagreement).
     2. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
-       Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+    3. All boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+       On first call for the ``default`` board, if the legacy path
+       ``<root>/kanban.db`` exists but ``boards/default/kanban.db`` does
+       not, the old file is migrated automatically (moved, not copied)
+       to keep multi-process concurrency safe.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
@@ -426,9 +495,10 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
+    new_path = board_dir(slug) / "kanban.db"
     if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+        _migrate_legacy_default_db(new_path)
+    return new_path
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -438,9 +508,9 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly (highest
     precedence) — the dispatcher injects this into worker env.
 
-    ``default`` keeps the legacy path ``<root>/kanban/workspaces/`` so
-    that existing scratch workspaces from before the boards feature are
-    preserved. Other boards use ``<root>/kanban/boards/<slug>/workspaces/``.
+    All boards now use ``<root>/kanban/boards/<slug>/workspaces/``.
+    On first call for the ``default`` board, a legacy directory at
+    ``<root>/kanban/workspaces/`` is symlinked or migrated.
     """
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
@@ -448,9 +518,10 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
+    target = board_dir(slug) / "workspaces"
     if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban" / "workspaces"
-    return board_dir(slug) / "workspaces"
+        _migrate_legacy_dir(kanban_home() / "kanban" / "workspaces", target)
+    return target
 
 
 def attachments_root(board: Optional[str] = None) -> Path:
@@ -491,17 +562,17 @@ def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
 def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Return the directory under which per-task worker logs are written.
 
-    ``default`` keeps the legacy path ``<root>/kanban/logs/``. Other
-    boards use ``<root>/kanban/boards/<slug>/logs/``. Logs follow the
-    board — makes ``hermes kanban log`` unambiguous even when multiple
-    boards have tasks with the same id.
+    All boards now use ``<root>/kanban/boards/<slug>/logs/``.
+    On first call for the ``default`` board, a legacy directory at
+    ``<root>/kanban/logs/`` is symlinked or migrated.
     """
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
+    target = board_dir(slug) / "logs"
     if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban" / "logs"
-    return board_dir(slug) / "logs"
+        _migrate_legacy_dir(kanban_home() / "kanban" / "logs", target)
+    return target
 
 
 def board_metadata_path(board: Optional[str] = None) -> Path:

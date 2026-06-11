@@ -40,7 +40,7 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
 
 
 def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
-    """Worker sessions get task lifecycle tools, not board-routing tools."""
+    """Worker sessions get task lifecycle tools AND board-routing tools."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -57,6 +57,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_list", "kanban_unblock",  # Workers can see board for cross-task awareness
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -84,15 +85,15 @@ def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_pat
     assert "kanban_show" in names
     assert "kanban_complete" in names
     assert "kanban_block" in names
-    assert "kanban_list" not in names
+    assert "kanban_list" in names  # Workers can see the board for cross-task awareness
 
 
-def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_path):
-    """Task scope wins over profile config for board-routing tools.
+def test_worker_with_kanban_toolset_sees_board_routing(monkeypatch, tmp_path):
+    """Workers with board scope can see kanban_list and kanban_unblock.
 
-    Even if a worker process happens to also have ``toolsets: [kanban]``
-    in its config, the HERMES_KANBAN_TASK env var means it's a focused
-    worker and must not see kanban_list / kanban_unblock.
+    Board-level tools are available to workers because they are already
+    board-isolated via HERMES_KANBAN_DB. This allows workers to unblock
+    downstream dependencies directly, reducing serial latency.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -111,9 +112,9 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     assert {
         "kanban_list",
         "kanban_unblock",
-    }.isdisjoint(kanban), (
-        f"Board-routing tools leaked into worker schema: "
-        f"{kanban & {'kanban_list', 'kanban_unblock'}}"
+    }.issubset(kanban), (
+        f"Board-routing tools missing from worker schema: "
+        f"{ {'kanban_list', 'kanban_unblock'} - kanban }"
     )
 
 
@@ -1358,13 +1359,13 @@ def test_worker_can_comment_on_foreign_task(worker_env):
         conn.close()
 
 
-def test_worker_unblock_rejects_foreign_task_id(worker_env):
-    """A worker cannot unblock any task — kanban_unblock is orchestrator-only.
+def test_worker_unblock_succeeds_for_foreign_task_id(worker_env):
+    """A worker can unblock any task on the same board.
 
-    The check fires before the per-task ownership check, so the error
-    surface is the orchestrator-only refusal rather than the
-    cross-task-ownership refusal. Either is fine — the property we're
-    pinning is "worker cannot mutate foreign task via kanban_unblock".
+    Workers are board-isolated via HERMES_KANBAN_DB, so allowing them to
+    unblock peers reduces serial latency in dependency chains — a worker
+    that finishes its task can directly unblock a downstream dependency
+    without waiting for a human or the next dispatcher tick.
     """
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -1377,14 +1378,13 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_unblock({"task_id": other})
     d = json.loads(out)
-    err = d.get("error", "")
-    assert "orchestrator-only" in err or "refusing to mutate" in err, (
-        f"expected worker-rejection error, got {err}"
+    assert d.get("unblocked") or d.get("ok") or "unblocked" in str(d).lower(), (
+        f"expected unblock success, got {d}"
     )
 
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, other).status == "blocked"
+        assert kb.get_task(conn, other).status == "ready"
     finally:
         conn.close()
 
